@@ -1,101 +1,125 @@
-// Paste this entire script into Chrome DevTools Console (F12 → Console tab)
-// while on the NotJustAnalytics profile page
+// Paste this into Chrome DevTools Console (F12 → Console tab)
+// while on the NotJustAnalytics profile analysis page
+// First time: type "allow pasting" and press Enter
 
 (function () {
-    // Grab ALL text from the page body
-    const allText = document.body.innerText;
+    // --- Helper: parse numbers like "1,124,624" or "17M" or "1.128.112" ---
+    function parseNum(text) {
+        if (!text) return 0;
+        text = text.trim();
 
-    // Try to extract metrics by scanning all elements
-    const allElements = document.querySelectorAll('*');
-    const metrics = {};
-    const labels = ['follower', 'following', 'post', 'e.r.', 'engagement', 'avg like', 'avg comment', 'average like', 'average comment', 'growth', 'authenticity', 'er'];
+        // Handle K/M/B suffixes (e.g., "17M", "2.5K")
+        const suffixMatch = text.match(/^([\d.,]+)\s*([KMB])$/i);
+        if (suffixMatch) {
+            const num = parseFloat(suffixMatch[1].replace(/,/g, ''));
+            const mult = { K: 1000, M: 1000000, B: 1000000000 }[suffixMatch[2].toUpperCase()];
+            return num * mult;
+        }
 
-    // Method 1: Find labeled values (label near a number)
-    allElements.forEach(el => {
-        const text = el.innerText?.trim()?.toLowerCase();
+        // Detect European format: "1.128.112" (dots as thousands, no comma)
+        // vs standard: "1,124,624" (commas as thousands)
+        if (/^\d{1,3}(\.\d{3}){2,}$/.test(text)) {
+            // European format — dots are thousands separators
+            return parseInt(text.replace(/\./g, ''), 10);
+        }
 
+        // Standard format — commas are thousands separators
+        return parseFloat(text.replace(/,/g, '')) || 0;
+    }
 
-        if (!text || text.length > 50) return; // skip long text blocks
-
-        labels.forEach(label => {
-            if (text === label || text === label + 's') {
-                // Found a label - check siblings and parent for the value
+    // --- Helper: find value by DOM label (most reliable) ---
+    function findByLabel(labelText) {
+        const allEls = document.querySelectorAll('*');
+        for (const el of allEls) {
+            const t = el.innerText?.trim()?.toLowerCase();
+            if (t === labelText || t === labelText + 's') {
                 const parent = el.parentElement;
-                if (parent) {
-                    const siblings = Array.from(parent.children);
-                    siblings.forEach(sib => {
-                        const sibText = sib.innerText?.trim();
-                        if (sib !== el && sibText && /[\d.,]+[KMB%]?/.test(sibText)) {
-                            metrics[label] = sibText;
-                        }
-                    });
-                    // Also check parent's text
-                    const parentText = parent.innerText?.trim();
-                    const numbers = parentText.match(/[\d.,]+[KMB%]?\s*/g);
-                    if (numbers && !metrics[label]) {
-                        metrics[label] = numbers[0].trim();
+                if (!parent) continue;
+                // Check sibling elements for a number
+                for (const sib of parent.children) {
+                    if (sib === el) continue;
+                    const sibText = sib.innerText?.trim();
+                    if (sibText && /^[\d.,]+[KMB]?$/.test(sibText)) {
+                        return sibText;
                     }
                 }
             }
-        });
-    });
-
-    // Method 2: Regex scan the full page text for common patterns
-    const patterns = {
-        followers_pattern: /(\d[\d.,]*[KMB]?)\s*(?:follower)/i,
-        following_pattern: /(\d[\d.,]*[KMB]?)\s*(?:following)/i,
-        posts_pattern: /(\d[\d.,]*[KMB]?)\s*(?:post)/i,
-        er_pattern: /(\d[\d.,]*%?)\s*(?:e\.?r\.?|engagement\s*rate)/i,
-        avg_likes_pattern: /(\d[\d.,]*[KMB]?)\s*(?:avg\.?\s*like|average\s*like)/i,
-        avg_comments_pattern: /(\d[\d.,]*[KMB]?)\s*(?:avg\.?\s*comment|average\s*comment)/i,
-        growth_pattern: /([+-]?\d[\d.,]*%?)\s*(?:growth|trend)/i,
-    };
-
-    const regexResults = {};
-    for (const [key, pattern] of Object.entries(patterns)) {
-        const match = allText.match(pattern);
-        if (match) regexResults[key] = match[1];
+        }
+        return null;
     }
 
-    // Also try reversed pattern: label THEN number
-    const reversedPatterns = {
-        followers_rev: /(?:follower)s?\s*[:\s]*(\d[\d.,]*[KMB]?)/i,
-        following_rev: /(?:following)\s*[:\s]*(\d[\d.,]*[KMB]?)/i,
-        posts_rev: /(?:post)s?\s*[:\s]*(\d[\d.,]*[KMB]?)/i,
-        er_rev: /(?:e\.?r\.?|engagement\s*rate)\s*[:\s]*(\d[\d.,]*%?)/i,
-    };
-
-    for (const [key, pattern] of Object.entries(reversedPatterns)) {
-        const match = allText.match(pattern);
-        if (match) regexResults[key] = match[1];
+    // --- Helper: find value from raw text (NUMBER before LABEL) ---
+    function findBeforeLabel(label) {
+        const allText = document.body.innerText;
+        // Match: number on one line, label on next line
+        const regex = new RegExp('([\\d.,]+[KMB]?)\\s*\\n\\s*' + label, 'i');
+        const match = allText.match(regex);
+        return match ? match[1] : null;
     }
 
-    // Build final output
+    // --- Helper: extract daily growth from "Average followers per day" ---
+    function findDailyGrowth() {
+        const allText = document.body.innerText;
+        const match = allText.match(/([-+]?[\d.,]+)\s*\n\s*Average followers per day/i);
+        return match ? parseNum(match[1]) : 0;
+    }
+
+    // --- Extract each metric using the best method ---
+    // Followers: use regex (label_scan returns European format)
+    const followersRaw = findBeforeLabel('Followers');
+    const followers = parseNum(followersRaw);
+
+    // Following & Posts: use DOM label scan (regex grabs weekly changes)
+    const followingRaw = findByLabel('following');
+    const following = parseNum(followingRaw);
+
+    const postsRaw = findByLabel('post');
+    const postsCount = parseNum(postsRaw);
+
+    // Avg Likes & Comments: both methods agree, use either
+    const avgLikesRaw = findByLabel('avg like') || findBeforeLabel('Avg likes');
+    const avgLikes = parseNum(avgLikesRaw);
+
+    const avgCommentsRaw = findByLabel('avg comment') || findBeforeLabel('Avg comments');
+    const avgComments = parseNum(avgCommentsRaw);
+
+    // Engagement Rate: calculated (site locks it behind login)
+    const engagementRate = followers > 0
+        ? Math.round(((avgLikes + avgComments) / followers) * 10000) / 100
+        : 0;
+
+    // Growth Rate: convert daily followers change → monthly percentage
+    const dailyGrowth = findDailyGrowth();
+    const growthRate = followers > 0
+        ? Math.round((dailyGrowth * 30 / followers) * 1000) / 10
+        : 0;
+
+    // Username: from URL
+    const username = window.location.pathname.split('/').pop();
+
+    // --- Build final output matching client.py format ---
     const result = {
-        username: window.location.pathname.split('/').pop(),
-        page_url: window.location.href,
-        scraped_at: new Date().toISOString(),
-
-        // From label scanning
-        label_scan: metrics,
-
-        // From regex scanning
-        regex_scan: regexResults,
-
-        // Raw text dump of the page (first 3000 chars for review)
-        raw_page_text: allText.substring(0, 3000)
+        username: username,
+        followers: followers,
+        following: following,
+        posts_count: postsCount,
+        engagement_rate: engagementRate,
+        avg_likes: avgLikes,
+        avg_comments: avgComments,
+        growth_rate: growthRate,
+        authenticity_score: 0
     };
 
-    // Pretty print to console
-    const jsonStr = JSON.stringify(result, null, 2);
-    console.log("=== SCRAPED DATA ===");
+    // Pretty print
+    const jsonStr = JSON.stringify(result, null, 4);
+    console.log("=== CLEANED DATA FOR info.JSON ===");
     console.log(jsonStr);
 
-    // Also copy to clipboard
+    // Copy to clipboard
     navigator.clipboard.writeText(jsonStr).then(() => {
-        console.log("\n✅ JSON copied to clipboard! Paste it into info.JSON");
+        console.log("\n✅ Copied to clipboard! Paste into info.JSON");
     }).catch(() => {
-        console.log("\n⚠️ Couldn't copy to clipboard. Select the JSON above, right-click → Copy.");
+        console.log("\n⚠️ Couldn't auto-copy. Select the JSON above → right-click → Copy");
     });
 
     return result;
