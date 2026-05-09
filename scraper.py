@@ -9,7 +9,7 @@ def get_profile_data(username: str) -> dict:
     
     driver = uc.Chrome(options=options)
     try:
-        url = f"https://www.notjustanalytics.com/{username}"
+        url = f"https://app.notjustanalytics.com/analysis/i_am_anupdutta"
         driver.get(url)
         time.sleep(random.uniform(3, 6))  # Human-like delay
         
