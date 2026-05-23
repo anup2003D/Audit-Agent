@@ -38,6 +38,7 @@ def get_profile_data(username: str, headless: bool = False) -> dict:
 
     options = uc.ChromeOptions()
 
+
     if headless:
         options.add_argument("--headless=new")
 
