@@ -1,79 +1,127 @@
 # scraper.py
-# AUTOMATION layer — drives Chrome to the website and orchestrates the scraping
+# AUTOMATION layer — drives Chrome to the website and orchestrates the scraping.
 # The actual extraction logic lives in extractor.py
 #
-# Think of it like this:
-#   scraper.py   = the driver (Selenium — opens browser, navigates, waits)
-#   extractor.py = the reader (JavaScript — parses the page, extracts numbers)
+# nodriver is the official successor of undetected-chromedriver.
+# It communicates directly via Chrome DevTools Protocol (CDP) — no Selenium,
+# no chromedriver binary needed. It is fully async, so we wrap it for Streamlit.
 
-import undetected_chromedriver as uc
-import time
+import asyncio
 import json
 import sys
 import os
+import time
+
+import nodriver as uc
 
 from extractor import EXTRACT_JS, validate_result, clean_result
 
 
+# ---------------------------------------------------------------------------
+# Public sync entry-point (called by app.py / Streamlit)
+# ---------------------------------------------------------------------------
+
 def get_profile_data(username: str, headless: bool = False) -> dict:
     """
-    Scrape an Instagram profile from NotJustAnalytics.
+    Synchronous wrapper so that Streamlit can call the async scraper directly.
+    Raises on failure — the caller (app.py) handles displaying the error.
+    """
+    return uc.loop().run_until_complete(_scrape(username, headless))
 
-    This function handles the AUTOMATION side:
-    1. Launch Chrome (with anti-detection patches)
-    2. Navigate to the profile page
-    3. Wait for data to load
-    4. Call the extraction logic from extractor.py
-    5. Return the clean result
 
-    Args:
-        username: Instagram username (without @)
-        headless: If True, run Chrome without a visible window.
-                  Default False because Cloudflare blocks headless more often.
+def save_to_json(data: dict, filepath: str = "info.JSON"):
+    """Save scraped data to a JSON file next to this script."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(script_dir, filepath)
+    with open(full_path, "w") as f:
+        json.dump(data, f, indent=4)
+    print(f"[scraper] Saved to {full_path}")
 
-    Returns:
-        dict matching the format that llm/client.py expects
+
+# ---------------------------------------------------------------------------
+# Async implementation
+# ---------------------------------------------------------------------------
+
+async def _scrape(username: str, headless: bool) -> dict:
+    """
+    Full scraping pipeline using nodriver:
+    1. Start Chrome (patched to evade bot detection)
+    2. Navigate to the NotJustAnalytics profile page
+    3. Handle any Cloudflare challenge (cf_verify)
+    4. Wait for the data section to render
+    5. Inject extraction JS and collect the result
+    6. Validate, clean, and return
     """
     print(f"[scraper] Launching Chrome for @{username}...")
 
-    options = uc.ChromeOptions()
-
-
-    if headless:
-        options.add_argument("--headless=new")
-
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
-
-    # undetected-chromedriver patches Chrome so Cloudflare thinks
-    # it's a real human browser, not a Selenium bot
-    # version_main must match your installed Chrome version (check chrome://version)
-    driver = uc.Chrome(options=options, version_main=148)
+    browser = await uc.start(
+        headless=headless,
+        browser_args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--window-size=1920,1080",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
 
     try:
         url = f"https://app.notjustanalytics.com/analysis/{username}"
         print(f"[scraper] Navigating to {url}")
-        driver.get(url)
+        tab = await browser.get(url)
 
-        # --- Wait for data to load ---
-        print("[scraper] Waiting for page to load (Cloudflare + data)...")
-        _wait_for_data(driver, timeout=20)
+        # ── Step 1: attempt Cloudflare bypass ─────────────────────────────
+        # nodriver has a built-in helper that detects and clicks the CF checkbox
+        print("[scraper] Attempting Cloudflare bypass...")
+        try:
+            await tab.cf_verify()
+            print("[scraper] Cloudflare check passed (or not present).")
+        except Exception as cf_err:
+            print(f"[scraper] cf_verify skipped/failed: {cf_err}")
+            # Not fatal — the page may not have a CF challenge
 
-        # --- Inject JS from extractor.py and get the result ---
+        # ── Step 2: wait for actual data to appear ─────────────────────────
+        print("[scraper] Waiting for analytics data to load...")
+        loaded = await _wait_for_data(tab, timeout=40)
+
+        if not loaded:
+            # Dump page text to help debug what blocked us
+            try:
+                body = await tab.evaluate("document.body.innerText || ''")
+                preview = (body or "")[:500].replace("\n", " ")
+                print(f"[scraper] Page text preview (500 chars): {preview}")
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Timed out waiting for analytics data. "
+                "The page may still be behind a Cloudflare challenge, "
+                "or the username doesn't exist on NotJustAnalytics."
+            )
+
+        # ── Step 3: extract metrics via JS ─────────────────────────────────
         print("[scraper] Extracting metrics via JavaScript...")
-        result = driver.execute_script(EXTRACT_JS)
+        result = await tab.evaluate(EXTRACT_JS)
+
+        # result from tab.evaluate() can be None if the JS returned undefined
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"JS extractor returned unexpected type: {type(result).__name__} "
+                f"(value={result!r}). The page structure may have changed."
+            )
 
         if not validate_result(result):
-            # Data didn't load — try waiting a bit more and retry
-            print("[scraper] No data found, retrying after extra wait...")
-            time.sleep(5)
-            result = driver.execute_script(EXTRACT_JS)
+            # Retry once with a short extra wait for late-loading numbers
+            print("[scraper] Metrics look empty — waiting 6s and retrying...")
+            await asyncio.sleep(6)
+            result = await tab.evaluate(EXTRACT_JS)
 
-        # Clean and validate the result
+            if not isinstance(result, dict) or not validate_result(result):
+                raise RuntimeError(
+                    "Extracted data has zero followers after retry. "
+                    "The profile may be private, or the page layout has changed."
+                )
+
         result = clean_result(result, username)
-
-        print(f"[scraper] Done! Extracted data for @{username}")
+        print(f"[scraper] Done! Extracted data for @{username}: {result}")
         return result
 
     except Exception as e:
@@ -81,40 +129,42 @@ def get_profile_data(username: str, headless: bool = False) -> dict:
         raise
 
     finally:
-        driver.quit()
+        browser.stop()
         print("[scraper] Browser closed.")
 
 
-def _wait_for_data(driver, timeout: int = 20):
+async def _wait_for_data(tab, timeout: int = 40) -> bool:
     """
-    Wait until the page text contains 'Followers' — meaning the data
-    section has rendered (not just the loading skeleton).
-    Falls back to proceeding anyway if the check times out.
+    Poll the page body until 'Followers' and 'Avg' appear, confirming the
+    analytics section has rendered.
+
+    Returns True if data was found, False if the timeout was reached.
     """
     start = time.time()
     while time.time() - start < timeout:
         try:
-            body_text = driver.execute_script("return document.body.innerText || '';")
-            # Check if the main data labels have appeared
-            if "Followers" in body_text and "Avg" in body_text:
-                # Give it 1 more second for any late-loading numbers
-                time.sleep(1)
-                return
+            body_text = await tab.evaluate("document.body.innerText || ''")
+            if isinstance(body_text, str):
+                # Check for analytics data keywords
+                if "Followers" in body_text and "Avg" in body_text:
+                    await asyncio.sleep(1.5)  # brief wait for late-loading numbers
+                    return True
+                # Detect still-loading states so we can log them
+                if "Checking" in body_text or "Just a moment" in body_text:
+                    print("[scraper] Cloudflare challenge page detected, waiting...")
+                elif "Page not found" in body_text or "404" in body_text:
+                    raise RuntimeError(
+                        f"Profile not found on NotJustAnalytics. "
+                        "Make sure the username is correct."
+                    )
+        except RuntimeError:
+            raise  # re-raise our own specific errors
         except Exception:
-            pass
-        time.sleep(1)
+            pass  # CDP hiccup — retry next tick
 
-    # If we get here, the timeout was reached — proceed anyway
-    print(f"[scraper] Warning: Timed out after {timeout}s waiting for data to load")
+        await asyncio.sleep(1.5)
 
-
-def save_to_json(data: dict, filepath: str = "info.JSON"):
-    """Save scraped data to a JSON file."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    full_path = os.path.join(script_dir, filepath)
-    with open(full_path, "w") as f:
-        json.dump(data, f, indent=4)
-    print(f"[scraper] Saved to {full_path}")
+    return False  # timed out
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +180,7 @@ if __name__ == "__main__":
 
     if validate_result(data):
         save_to_json(data)
-        print(f"\n--- Result ---")
+        print("\n--- Result ---")
         print(json.dumps(data, indent=4))
     else:
         print("\n[scraper] Failed to extract data.")
