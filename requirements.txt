@@ -1,5 +1,5 @@
-nodriver>=0.38
-beautifulsoup4>=4.12.0
+undetected-chromedriver>=3.5.0
+selenium>=4.20.0
 sqlalchemy>=2.0.0
 google-generativeai>=0.8.0
 streamlit>=1.38.0

@@ -2,31 +2,74 @@
 # AUTOMATION layer — drives Chrome to the website and orchestrates the scraping.
 # The actual extraction logic lives in extractor.py
 #
-# nodriver is the official successor of undetected-chromedriver.
-# It communicates directly via Chrome DevTools Protocol (CDP) — no Selenium,
-# no chromedriver binary needed. It is fully async, so we wrap it for Streamlit.
+# Uses undetected-chromedriver — a patched Selenium ChromeDriver that evades
+# bot detection (Cloudflare, etc.) automatically.  Fully synchronous.
 
-import asyncio
 import json
 import sys
 import os
 import time
+import platform
 
-import nodriver as uc
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
 
 from extractor import EXTRACT_JS, validate_result, clean_result
 
 
 # ---------------------------------------------------------------------------
-# Public sync entry-point (called by app.py / Streamlit)
+# Chrome version detection (prevents ChromeDriver mismatch)
+# ---------------------------------------------------------------------------
+
+def _detect_chrome_version() -> int | None:
+    """
+    Auto-detect the installed Chrome major version.
+    Returns an int like 148, or None if detection fails.
+    """
+    if platform.system() == "Windows":
+        import winreg
+        # Try HKCU first (per-user install), then HKLM (system-wide)
+        for hive, subkey in [
+            (winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Google\Chrome\BLBeacon"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon"),
+        ]:
+            try:
+                key = winreg.OpenKey(hive, subkey)
+                version, _ = winreg.QueryValueEx(key, "version")
+                winreg.CloseKey(key)
+                major = int(version.split(".")[0])
+                print(f"[scraper] Detected Chrome version: {version} (major={major})")
+                return major
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+    else:
+        # macOS / Linux — try shell
+        import subprocess
+        for cmd in ["google-chrome --version", "chromium --version"]:
+            try:
+                out = subprocess.check_output(cmd, shell=True, text=True).strip()
+                major = int(out.split()[-1].split(".")[0])
+                print(f"[scraper] Detected Chrome version: {out} (major={major})")
+                return major
+            except Exception:
+                continue
+
+    print("[scraper] Could not auto-detect Chrome version, letting UC decide.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public entry-point (called by app.py / Streamlit)
 # ---------------------------------------------------------------------------
 
 def get_profile_data(username: str, headless: bool = False) -> dict:
     """
-    Synchronous wrapper so that Streamlit can call the async scraper directly.
-    Raises on failure — the caller (app.py) handles displaying the error.
+    Scrape the NotJustAnalytics profile page for the given Instagram username.
+    Returns a dict of metrics.  Raises on failure — the caller (app.py)
+    handles displaying the error.
     """
-    return uc.loop().run_until_complete(_scrape(username, headless))
+    return _scrape(username, headless)
 
 
 def save_to_json(data: dict, filepath: str = "info.JSON"):
@@ -39,54 +82,48 @@ def save_to_json(data: dict, filepath: str = "info.JSON"):
 
 
 # ---------------------------------------------------------------------------
-# Async implementation
+# Implementation
 # ---------------------------------------------------------------------------
 
-async def _scrape(username: str, headless: bool) -> dict:
+def _scrape(username: str, headless: bool) -> dict:
     """
-    Full scraping pipeline using nodriver:
-    1. Start Chrome (patched to evade bot detection)
+    Full scraping pipeline using undetected-chromedriver:
+    1. Start a patched Chrome (evades bot detection automatically)
     2. Navigate to the NotJustAnalytics profile page
-    3. Handle any Cloudflare challenge (cf_verify)
-    4. Wait for the data section to render
-    5. Inject extraction JS and collect the result
-    6. Validate, clean, and return
+    3. Wait for the data section to render (Cloudflare is handled passively)
+    4. Inject extraction JS and collect the result
+    5. Validate, clean, and return
     """
     print(f"[scraper] Launching Chrome for @{username}...")
 
-    browser = await uc.start(
-        headless=headless,
-        browser_args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--window-size=1920,1080",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
+    chrome_ver = _detect_chrome_version()
+
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+
+    if headless:
+        options.add_argument("--headless=new")
+
+    driver = uc.Chrome(options=options, version_main=chrome_ver)
 
     try:
         url = f"https://app.notjustanalytics.com/analysis/{username}"
         print(f"[scraper] Navigating to {url}")
-        tab = await browser.get(url)
+        driver.get(url)
 
-        # ── Step 1: attempt Cloudflare bypass ─────────────────────────────
-        # nodriver has a built-in helper that detects and clicks the CF checkbox
-        print("[scraper] Attempting Cloudflare bypass...")
-        try:
-            await tab.cf_verify()
-            print("[scraper] Cloudflare check passed (or not present).")
-        except Exception as cf_err:
-            print(f"[scraper] cf_verify skipped/failed: {cf_err}")
-            # Not fatal — the page may not have a CF challenge
-
-        # ── Step 2: wait for actual data to appear ─────────────────────────
+        # ── Step 1: wait for actual data to appear ─────────────────────────
+        # undetected-chromedriver handles Cloudflare passively — its patched
+        # binary avoids triggering the challenge in most cases.  We just need
+        # to wait for the analytics content to render.
         print("[scraper] Waiting for analytics data to load...")
-        loaded = await _wait_for_data(tab, timeout=40)
+        loaded = _wait_for_data(driver, timeout=45)
 
         if not loaded:
             # Dump page text to help debug what blocked us
             try:
-                body = await tab.evaluate("document.body.innerText || ''")
+                body = driver.execute_script("return document.body.innerText || '';")
                 preview = (body or "")[:500].replace("\n", " ")
                 print(f"[scraper] Page text preview (500 chars): {preview}")
             except Exception:
@@ -97,11 +134,11 @@ async def _scrape(username: str, headless: bool) -> dict:
                 "or the username doesn't exist on NotJustAnalytics."
             )
 
-        # ── Step 3: extract metrics via JS ─────────────────────────────────
+        # ── Step 2: extract metrics via JS ─────────────────────────────────
         print("[scraper] Extracting metrics via JavaScript...")
-        result = await tab.evaluate(EXTRACT_JS)
+        result = driver.execute_script(EXTRACT_JS)
 
-        # result from tab.evaluate() can be None if the JS returned undefined
+        # execute_script returns None if the JS returned undefined
         if not isinstance(result, dict):
             raise RuntimeError(
                 f"JS extractor returned unexpected type: {type(result).__name__} "
@@ -111,8 +148,8 @@ async def _scrape(username: str, headless: bool) -> dict:
         if not validate_result(result):
             # Retry once with a short extra wait for late-loading numbers
             print("[scraper] Metrics look empty — waiting 6s and retrying...")
-            await asyncio.sleep(6)
-            result = await tab.evaluate(EXTRACT_JS)
+            time.sleep(6)
+            result = driver.execute_script(EXTRACT_JS)
 
             if not isinstance(result, dict) or not validate_result(result):
                 raise RuntimeError(
@@ -129,11 +166,11 @@ async def _scrape(username: str, headless: bool) -> dict:
         raise
 
     finally:
-        browser.stop()
+        driver.quit()
         print("[scraper] Browser closed.")
 
 
-async def _wait_for_data(tab, timeout: int = 40) -> bool:
+def _wait_for_data(driver, timeout: int = 45) -> bool:
     """
     Poll the page body until 'Followers' and 'Avg' appear, confirming the
     analytics section has rendered.
@@ -143,26 +180,26 @@ async def _wait_for_data(tab, timeout: int = 40) -> bool:
     start = time.time()
     while time.time() - start < timeout:
         try:
-            body_text = await tab.evaluate("document.body.innerText || ''")
+            body_text = driver.execute_script("return document.body.innerText || '';")
             if isinstance(body_text, str):
                 # Check for analytics data keywords
                 if "Followers" in body_text and "Avg" in body_text:
-                    await asyncio.sleep(1.5)  # brief wait for late-loading numbers
+                    time.sleep(1.5)  # brief wait for late-loading numbers
                     return True
                 # Detect still-loading states so we can log them
                 if "Checking" in body_text or "Just a moment" in body_text:
                     print("[scraper] Cloudflare challenge page detected, waiting...")
                 elif "Page not found" in body_text or "404" in body_text:
                     raise RuntimeError(
-                        f"Profile not found on NotJustAnalytics. "
+                        "Profile not found on NotJustAnalytics. "
                         "Make sure the username is correct."
                     )
         except RuntimeError:
             raise  # re-raise our own specific errors
         except Exception:
-            pass  # CDP hiccup — retry next tick
+            pass  # WebDriver hiccup — retry next tick
 
-        await asyncio.sleep(1.5)
+        time.sleep(1.5)
 
     return False  # timed out
 

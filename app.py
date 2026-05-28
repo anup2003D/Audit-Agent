@@ -4,6 +4,9 @@ import streamlit as st
 import json
 import os
 import time
+from dotenv import load_dotenv
+
+load_dotenv()  # load .env (GOOGLE_API_KEY, etc.) into environment
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
